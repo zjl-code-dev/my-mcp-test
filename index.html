@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>AI Chat with SSE (带停止功能)</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://cdn.jsdelivr.net/npm/font-awesome@4.7.0/css/font-awesome.min.css" rel="stylesheet">
+    
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    colors: {
+                        primary: '#3B82F6',
+                        secondary: '#10B981',
+                        danger: '#EF4444',
+                        dark: '#1E293B',
+                        light: '#F8FAFC'
+                    },
+                    fontFamily: {
+                        sans: ['Inter', 'system-ui', 'sans-serif'],
+                    },
+                }
+            }
+        }
+    </script>
+    
+    <style type="text/tailwindcss">
+        @layer utilities {
+            .content-auto {
+                content-visibility: auto;
+            }
+            .scrollbar-hide {
+                -ms-overflow-style: none;
+                scrollbar-width: none;
+            }
+            .scrollbar-hide::-webkit-scrollbar {
+                display: none;
+            }
+        }
+    </style>
+</head>
+<body class="bg-gray-100 font-sans">
+    <div class="container mx-auto px-4 py-8 max-w-4xl">
+        <h1 class="text-3xl font-bold text-center mb-8 text-dark">
+            <i class="fa fa-comments text-primary mr-2"></i>AI Chat with SSE
+        </h1>
+        
+        <!-- 聊天消息区域 -->
+        <div id="chat-container" class="bg-white rounded-lg shadow-lg h-[60vh] overflow-y-auto p-4 mb-6 scrollbar-hide">
+            <div class="text-center text-gray-500 mb-4">
+                <i class="fa fa-info-circle"></i> 开始与AI聊天吧（可随时停止生成）
+            </div>
+            <!-- 消息会动态添加到这里 -->
+        </div>
+        
+        <!-- 输入和控制区域 -->
+        <div class="flex flex-col md:flex-row gap-4">
+            <textarea 
+                id="message-input" 
+                class="flex-1 border border-gray-300 rounded-lg p-3 focus:outline-none focus:ring-2 focus:ring-primary focus:border-transparent resize-none"
+                placeholder="输入你的消息..."
+                rows="3"
+            ></textarea>
+            <div class="flex gap-2">
+                <button 
+                    id="send-button" 
+                    class="bg-primary hover:bg-primary/90 text-white font-medium py-3 px-6 rounded-lg transition duration-200 flex items-center justify-center flex-1"
+                >
+                    <i class="fa fa-paper-plane mr-2"></i> 发送
+                </button>
+                <button 
+                    id="stop-button" 
+                    class="bg-danger hover:bg-danger/90 text-white font-medium py-3 px-6 rounded-lg transition duration-200 flex items-center justify-center flex-1"
+                    disabled
+                >
+                    <i class="fa fa-stop mr-2"></i> 停止
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', () => {
+            const chatContainer = document.getElementById('chat-container');
+            const messageInput = document.getElementById('message-input');
+            const sendButton = document.getElementById('send-button');
+            const stopButton = document.getElementById('stop-button');
+            
+            // 生成唯一会话ID（用于标识当前对话，实现停止功能）
+            let sessionId = generateSessionId();
+            // 当前的请求控制器（用于中断网络请求）
+            let abortController = null;
+            
+            // 生成会话ID
+            function generateSessionId() {
+                return Date.now() + '-' + Math.random().toString(36).substr(2, 9);
+            }
+            
+            // 发送消息函数
+            const sendMessage = () => {
+                const content = messageInput.value.trim();
+                if (!content) return;
+                
+                // 重置会话ID和控制器
+                sessionId = generateSessionId();
+                if (abortController) {
+                    abortController.abort(); // 终止可能存在的旧请求
+                }
+                abortController = new AbortController();
+                
+                // 添加用户消息到聊天界面
+                addMessageToUI(content, 'user');
+                
+                // 清空输入框并禁用发送按钮
+                messageInput.value = '';
+                sendButton.disabled = true;
+                stopButton.disabled = false; // 启用停止按钮
+                
+                // 创建用户消息对象
+                const message = {
+                    content: content,
+                    role: 'user'
+                };
+                
+                // 发送请求到后端SSE接口
+                fetch(`http://localhost:10081/api/chat/stream?sessionId=${sessionId}`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify(message),
+                    signal: abortController.signal // 关联中断信号
+                })
+                .then(response => {
+                    if (!response.ok) {
+                        throw new Error('网络响应异常');
+                    }
+                    
+                    // 获取SSE流
+                    const reader = response.body.getReader();
+                    const decoder = new TextDecoder();
+                    let assistantMessageElement = null;
+                    let fullMessage = '';
+                    
+                    // 处理SSE流的函数
+                    const processStream = ({ done, value }) => {
+                        if (done) {
+                            // 流结束后清理状态
+                            if (assistantMessageElement) {
+                                const typingIndicator = assistantMessageElement.querySelector('.typing-indicator');
+                                if (typingIndicator) typingIndicator.remove();
+                            }
+                            sendButton.disabled = false;
+                            stopButton.disabled = true;
+                            return;
+                        }
+                        
+                        // 解码接收到的内容
+                        const chunk = decoder.decode(value, { stream: true });
+                        
+                        // 提取SSE数据（格式：data: ...\n\n）
+                        const dataLines = chunk.split('\n')
+                            .filter(line => line.startsWith('data:'))
+                            .map(line => line.replaceAll('data:','').trim());
+                        
+                        // 处理每一行数据
+                        dataLines.forEach(data => {
+                            if (data) {
+                                fullMessage += data;
+                                
+                                // 如果还没有创建助手消息元素，则创建一个
+                                if (!assistantMessageElement) {
+                                    assistantMessageElement = addMessageToUI('', 'assistant', true);
+                                }
+                                
+                                // 更新助手消息内容
+                                assistantMessageElement.querySelector('.message-content').textContent = fullMessage;
+                            }
+                        });
+                        
+                        // 继续读取流
+                        return reader.read().then(processStream);
+                    };
+                    
+                    // 开始读取流
+                    return reader.read().then(processStream);
+                })
+                .catch(error => {
+                    // 忽略中止错误（用户主动停止）
+                    if (error.name !== 'AbortError') {
+                        console.error('错误:', error);
+                        addMessageToUI('发送消息时出错，请重试', 'system');
+                    }
+                    // 恢复按钮状态
+                    sendButton.disabled = false;
+                    stopButton.disabled = true;
+                });
+            };
+            
+            // 停止生成函数
+            const stopGeneration = () => {
+                if (abortController) {
+                    abortController.abort(); // 中断网络请求
+                }
+                // 调用后端停止接口（双重保险）
+                fetch(`http://localhost:10081/api/chat/stop?sessionId=${sessionId}`, {
+                    method: 'POST'
+                }).catch(err => console.log('停止请求失败:', err));
+                
+                // 更新UI状态
+                const typingIndicators = document.querySelectorAll('.typing-indicator');
+                typingIndicators.forEach(indicator => indicator.remove());
+                
+                sendButton.disabled = false;
+                stopButton.disabled = true;
+            };
+            
+            // 添加消息到UI
+            const addMessageToUI = (content, role, isStreaming = false) => {
+                const messageDiv = document.createElement('div');
+                messageDiv.className = `mb-4 ${role === 'user' ? 'flex justify-end' : 'flex justify-start'}`;
+                
+                const bubbleClass = role === 'user' 
+                    ? 'bg-primary text-white' 
+                    : role === 'assistant' 
+                        ? 'bg-gray-200 text-dark'
+                        : 'bg-red-100 text-red-800';
+                
+                const icon = role === 'user' 
+                    ? '<i class="fa fa-user-circle mr-2"></i>'
+                    : role === 'assistant'
+                        ? '<i class="fa fa-robot mr-2"></i>'
+                        : '<i class="fa fa-exclamation-circle mr-2"></i>';
+                
+                messageDiv.innerHTML = `
+                    <div class="max-w-[80%] p-3 rounded-lg ${bubbleClass}">
+                        <div class="font-medium mb-1 flex items-center">
+                            ${icon}
+                            <span>${role === 'user' ? '你' : role === 'assistant' ? 'AI助手' : '系统消息'}</span>
+                        </div>
+                        <div class="message-content">${content}</div>
+                        ${isStreaming ? '<div class="typing-indicator mt-2"><span class="dot"></span><span class="dot"></span><span class="dot"></span></div>' : ''}
+                    </div>
+                `;
+                
+                chatContainer.appendChild(messageDiv);
+                chatContainer.scrollTop = chatContainer.scrollHeight;
+                
+                // 添加打字动画样式
+                const style = document.createElement('style');
+                style.textContent = `
+                    .typing-indicator {
+                        display: flex;
+                        gap: 4px;
+                    }
+                    .typing-indicator .dot {
+                        width: 8px;
+                        height: 8px;
+                        border-radius: 50%;
+                        background-color: #666;
+                        animation: typing 1.4s infinite ease-in-out both;
+                    }
+                    .typing-indicator .dot:nth-child(1) { animation-delay: -0.32s; }
+                    .typing-indicator .dot:nth-child(2) { animation-delay: -0.16s; }
+                    @keyframes typing {
+                        0%, 80%, 100% { transform: scale(0); }
+                        40% { transform: scale(1); }
+                    }
+                `;
+                document.head.appendChild(style);
+                
+                return messageDiv;
+            };
+            
+            // 绑定按钮事件
+            sendButton.addEventListener('click', sendMessage);
+            stopButton.addEventListener('click', stopGeneration);
+            
+            // 绑定回车键发送消息（Ctrl+Enter换行）
+            messageInput.addEventListener('keydown', (e) => {
+                if (e.key === 'Enter' && !e.ctrlKey && !e.shiftKey) {
+                    e.preventDefault();
+                    sendMessage();
+                }
+            });
+        });
+    </script>
+</body>
+</html>

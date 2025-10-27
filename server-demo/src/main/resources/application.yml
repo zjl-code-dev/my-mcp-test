@@ -1,0 +1,14 @@
+spring:
+  application:
+    name: server-demo
+  ai:
+    mcp:
+      server:
+        name: my-mcp-server
+        version: 1.0.0
+        type: SYNC
+        sse-message-endpoint: /mcp/messages
+        stdio: false
+server:
+  port: 10080
+
